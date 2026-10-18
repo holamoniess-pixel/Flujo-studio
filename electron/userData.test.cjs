@@ -1,0 +1,60 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { resolveUserDataPolicy } = require('./shellContracts.cjs')
+const { ensureUserDataLayout, isSqliteFile } = require('./userData.cjs')
+
+function tempDirectory() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'flujo-electron-'))
+}
+
+test('user-data policy resolves default, custom, and portable modes', () => {
+  const defaultPath = path.join(tempDirectory(), 'default')
+  const customPath = path.join(tempDirectory(), 'custom')
+  const portableDir = path.join(tempDirectory(), 'portable')
+  assert.deepEqual(resolveUserDataPolicy({ defaultPath }), { path: path.normalize(defaultPath), mode: 'default' })
+  assert.deepEqual(resolveUserDataPolicy({ defaultPath, customPath }), { path: path.normalize(customPath), mode: 'custom' })
+  assert.deepEqual(resolveUserDataPolicy({ defaultPath, portableDir }), { path: path.normalize(path.join(portableDir, 'user-data')), mode: 'portable' })
+  assert.throws(() => resolveUserDataPolicy({ defaultPath, customPath: 'relative-path' }), /absolute/)
+})
+
+test('data layouts are isolated per installation and initialized with runtime directories', () => {
+  const rootA = tempDirectory()
+  const rootB = tempDirectory()
+  const a = ensureUserDataLayout({ dataRoot: rootA })
+  const b = ensureUserDataLayout({ dataRoot: rootB })
+  assert.notEqual(a.flujoDir, b.flujoDir)
+  for (const directory of [a.runtimeDir, a.logsDir, a.configDir, b.runtimeDir, b.logsDir, b.configDir]) assert.equal(fs.existsSync(directory), true)
+  assert.equal(JSON.parse(fs.readFileSync(a.schemaPath, 'utf8')).version, 1)
+})
+
+test('legacy runtime database files migrate without deleting the source', () => {
+  const legacy = tempDirectory()
+  const target = tempDirectory()
+  fs.mkdirSync(path.join(legacy, 'runtime'), { recursive: true })
+  const header = Buffer.alloc(4096)
+  Buffer.from('SQLite format 3\u0000').copy(header)
+  fs.writeFileSync(path.join(legacy, 'runtime', 'flujo.sqlite3'), header)
+  fs.writeFileSync(path.join(legacy, 'runtime', 'flujo.sqlite3-wal'), 'wal')
+  const result = ensureUserDataLayout({ dataRoot: target, legacyFlujoDir: legacy, now: new Date('2026-08-26T00:00:00.000Z') })
+  assert.deepEqual(result.migrated.sort(), [path.join('runtime', 'flujo.sqlite3'), path.join('runtime', 'flujo.sqlite3-wal')].sort())
+  assert.equal(fs.existsSync(path.join(target, '.flujo', 'runtime', 'flujo.sqlite3')), true)
+  assert.equal(fs.existsSync(path.join(legacy, 'runtime', 'flujo.sqlite3')), true)
+  assert.equal(isSqliteFile(path.join(target, '.flujo', 'runtime', 'flujo.sqlite3')), true)
+})
+
+test('corrupt schema and database are quarantined and replaced with safe state', () => {
+  const root = tempDirectory()
+  const flujo = path.join(root, '.flujo')
+  fs.mkdirSync(path.join(flujo, 'runtime'), { recursive: true })
+  fs.writeFileSync(path.join(flujo, 'data-schema.json'), '{not-json')
+  fs.writeFileSync(path.join(flujo, 'runtime', 'flujo.sqlite3'), 'not sqlite')
+  fs.writeFileSync(path.join(flujo, 'runtime', 'flujo.sqlite3-wal'), 'wal')
+  const result = ensureUserDataLayout({ dataRoot: root, now: new Date('2026-08-26T00:00:00.000Z') })
+  assert.equal(result.schemaRecovered, true)
+  assert.equal(result.quarantined.length, 2)
+  assert.equal(JSON.parse(fs.readFileSync(result.schemaPath, 'utf8')).version, 1)
+  assert.equal(fs.existsSync(path.join(flujo, 'runtime', 'flujo.sqlite3')), false)
+})
